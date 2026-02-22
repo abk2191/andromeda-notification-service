@@ -75,17 +75,26 @@ app.get("/test", async (req, res) => {
 
 app.get("/debug-auth", async (req, res) => {
   try {
-    // Get the service account info
-    const auth = admin.auth();
-    const serviceAccountInfo = await auth.getServiceAccount();
+    // Safely get project ID from environment
+    const projectId = process.env.FIREBASE_PROJECT_ID;
+
+    // Get the client email from the initialized app's options
+    // This is a safer way to check what credential is being used
+    const clientEmail = admin.app().options.credential?.clientEmail;
 
     res.json({
       success: true,
-      clientEmail: serviceAccountInfo?.client_email,
-      projectId: process.env.FIREBASE_PROJECT_ID,
+      projectId: projectId,
+      clientEmail: clientEmail || "Not available via this method",
+      note: "This confirms Firebase Admin is initialized",
     });
   } catch (error) {
-    res.json({ success: false, error: error.message });
+    res.json({
+      success: false,
+      error: error.message,
+      message:
+        "Firebase Admin is initialized but we couldn't extract the email",
+    });
   }
 });
 
