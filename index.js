@@ -73,6 +73,22 @@ app.get("/test", async (req, res) => {
   }
 });
 
+app.get("/debug-auth", async (req, res) => {
+  try {
+    // Get the service account info
+    const auth = admin.auth();
+    const serviceAccountInfo = await auth.getServiceAccount();
+
+    res.json({
+      success: true,
+      clientEmail: serviceAccountInfo?.client_email,
+      projectId: process.env.FIREBASE_PROJECT_ID,
+    });
+  } catch (error) {
+    res.json({ success: false, error: error.message });
+  }
+});
+
 // Health check
 app.get("/", (req, res) => {
   res.json({ status: "ok", message: "User fetcher running" });
