@@ -93,6 +93,7 @@ async function checkAndSendNotifications() {
         .get();
 
       const tokens = tokensSnapshot.docs.map((doc) => doc.id);
+      const tokenDocs = tokensSnapshot.docs; // Keep full docs for deviceId lookup
 
       console.log(`   🔑 Found ${tokens.length} FCM tokens for this user`);
 
@@ -112,16 +113,20 @@ async function checkAndSendNotifications() {
         continue;
       }
 
-      // Send each notification for this user
+      // Send each notification for this user with device-aware targeting
       for (const notification of userNotifications) {
         const notificationData = notification.data;
+        const creatingDeviceId = notificationData.deviceId;
 
         console.log(
-          `   📤 Sending notification: "${notificationData.body || "No message"}"`,
+          `   📤 Processing notification: "${notificationData.body || "No message"}"`,
+        );
+        console.log(
+          `   📱 Created on device: ${creatingDeviceId || "unknown"}`,
         );
 
-        // Prepare FCM message
-        const message = {
+        // Prepare base FCM message (without tokens)
+        const baseMessage = {
           notification: {
             title: notificationData.title || "🔔 Calendar Reminder",
             body: notificationData.body || "You have an upcoming event",
@@ -134,7 +139,6 @@ async function checkAndSendNotifications() {
             id: notification.id,
             click_action: "OPEN_CALENDAR",
           },
-          tokens: tokens,
           // Platform-specific configurations
           android: {
             priority: "high",
@@ -168,59 +172,218 @@ async function checkAndSendNotifications() {
           },
         };
 
-        try {
-          // Send to all user's devices
-          const response = await admin
-            .messaging()
-            .sendEachForMulticast(message);
-
+        if (!creatingDeviceId) {
           console.log(
-            `   ✅ Response: ${response.successCount} sent, ${response.failureCount} failed`,
+            `   ⚠️ No deviceId in notification, sending to all devices as fallback`,
           );
-          totalSent += response.successCount;
 
-          // Mark notification as sent
-          await notification.ref.update({
-            status: "sent",
-            sentAt: admin.firestore.FieldValue.serverTimestamp(),
-            fcmResponse: {
-              successCount: response.successCount,
-              failureCount: response.failureCount,
-            },
-          });
+          // Send to all tokens (original behavior)
+          const message = { ...baseMessage, tokens: tokens };
 
-          // Remove invalid tokens
-          if (response.failureCount > 0) {
+          try {
+            const response = await admin
+              .messaging()
+              .sendEachForMulticast(message);
             console.log(
-              `   🔄 Removing ${response.failureCount} invalid tokens`,
+              `   ✅ Fallback response: ${response.successCount} sent, ${response.failureCount} failed`,
             );
-            response.responses.forEach((resp, idx) => {
-              if (!resp.success) {
-                const failedToken = tokens[idx];
-                console.log(
-                  `      Removing token: ${failedToken.substring(0, 20)}...`,
-                );
-                db.collection("users")
-                  .doc(userId)
-                  .collection("fcmTokens")
-                  .doc(failedToken)
-                  .delete()
-                  .catch((err) => console.log("Error removing token:", err));
-              }
+            totalSent += response.successCount;
+
+            await notification.ref.update({
+              status: "sent",
+              sentAt: admin.firestore.FieldValue.serverTimestamp(),
+              fcmResponse: {
+                successCount: response.successCount,
+                failureCount: response.failureCount,
+              },
+            });
+
+            // Remove invalid tokens
+            if (response.failureCount > 0) {
+              console.log(
+                `   🔄 Removing ${response.failureCount} invalid tokens`,
+              );
+              response.responses.forEach((resp, idx) => {
+                if (!resp.success) {
+                  const failedToken = tokens[idx];
+                  console.log(
+                    `      Removing token: ${failedToken.substring(0, 20)}...`,
+                  );
+                  db.collection("users")
+                    .doc(userId)
+                    .collection("fcmTokens")
+                    .doc(failedToken)
+                    .delete()
+                    .catch((err) => console.log("Error removing token:", err));
+                }
+              });
+            }
+          } catch (error) {
+            console.error(`   ❌ Error sending fallback notification:`, error);
+            await notification.ref.update({
+              status: "failed",
+              error: error.message,
+              failedAt: admin.firestore.FieldValue.serverTimestamp(),
             });
           }
-        } catch (error) {
-          console.error(
-            `   ❌ Error sending notification ${notification.id}:`,
-            error,
+        } else {
+          // Filter tokens to find ones matching this device
+          const deviceTokens = [];
+          const otherTokens = [];
+
+          tokenDocs.forEach((doc) => {
+            const tokenData = doc.data();
+            if (tokenData.deviceId === creatingDeviceId) {
+              deviceTokens.push(doc.id);
+            } else {
+              otherTokens.push(doc.id);
+            }
+          });
+
+          console.log(
+            `   📱 Found ${deviceTokens.length} token(s) for creating device, ${otherTokens.length} for other devices`,
           );
 
-          // Mark as failed
-          await notification.ref.update({
-            status: "failed",
-            error: error.message,
-            failedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
+          // Send to the creating device first
+          if (deviceTokens.length > 0) {
+            const deviceMessage = { ...baseMessage, tokens: deviceTokens };
+
+            try {
+              const deviceResponse = await admin
+                .messaging()
+                .sendEachForMulticast(deviceMessage);
+              console.log(
+                `   ✅ Sent to creating device: ${deviceResponse.successCount} success, ${deviceResponse.failureCount} failed`,
+              );
+              totalSent += deviceResponse.successCount;
+
+              // Mark notification as sent
+              await notification.ref.update({
+                status: "sent",
+                sentAt: admin.firestore.FieldValue.serverTimestamp(),
+                sentToDevice: creatingDeviceId,
+                fcmResponse: {
+                  successCount: deviceResponse.successCount,
+                  failureCount: deviceResponse.failureCount,
+                },
+              });
+
+              // Remove invalid tokens if any
+              if (deviceResponse.failureCount > 0) {
+                deviceResponse.responses.forEach((resp, idx) => {
+                  if (!resp.success) {
+                    const failedToken = deviceTokens[idx];
+                    console.log(
+                      `      Removing invalid token: ${failedToken.substring(0, 20)}...`,
+                    );
+                    db.collection("users")
+                      .doc(userId)
+                      .collection("fcmTokens")
+                      .doc(failedToken)
+                      .delete()
+                      .catch((err) =>
+                        console.log("Error removing token:", err),
+                      );
+                  }
+                });
+              }
+            } catch (error) {
+              console.error(`   ❌ Error sending to device:`, error);
+
+              // Mark as failed but try fallback
+              await notification.ref.update({
+                status: "failed",
+                error: error.message,
+                failedAt: admin.firestore.FieldValue.serverTimestamp(),
+                note: "Failed to send to creating device",
+              });
+
+              // Optionally try fallback to all devices
+              if (otherTokens.length > 0) {
+                console.log(
+                  `   ⚠️ Attempting fallback to ${otherTokens.length} other devices`,
+                );
+                const fallbackMessage = { ...baseMessage, tokens: otherTokens };
+                try {
+                  const fallbackResponse = await admin
+                    .messaging()
+                    .sendEachForMulticast(fallbackMessage);
+                  console.log(
+                    `   ✅ Fallback sent to ${fallbackResponse.successCount} other devices`,
+                  );
+                  totalSent += fallbackResponse.successCount;
+                } catch (fallbackError) {
+                  console.error(`   ❌ Fallback also failed:`, fallbackError);
+                }
+              }
+            }
+          } else {
+            console.log(
+              `   ⚠️ No token found for creating device ${creatingDeviceId}`,
+            );
+
+            // Send to all devices as fallback
+            if (otherTokens.length > 0) {
+              console.log(
+                `   📱 Sending to ${otherTokens.length} other devices as fallback`,
+              );
+              const fallbackMessage = { ...baseMessage, tokens: otherTokens };
+
+              try {
+                const fallbackResponse = await admin
+                  .messaging()
+                  .sendEachForMulticast(fallbackMessage);
+                console.log(
+                  `   ✅ Fallback response: ${fallbackResponse.successCount} sent, ${fallbackResponse.failureCount} failed`,
+                );
+                totalSent += fallbackResponse.successCount;
+
+                await notification.ref.update({
+                  status: "sent",
+                  sentAt: admin.firestore.FieldValue.serverTimestamp(),
+                  note: "Sent to all available devices (no matching device token)",
+                  fcmResponse: {
+                    successCount: fallbackResponse.successCount,
+                    failureCount: fallbackResponse.failureCount,
+                  },
+                });
+
+                // Remove invalid tokens
+                if (fallbackResponse.failureCount > 0) {
+                  fallbackResponse.responses.forEach((resp, idx) => {
+                    if (!resp.success) {
+                      const failedToken = otherTokens[idx];
+                      console.log(
+                        `      Removing invalid token: ${failedToken.substring(0, 20)}...`,
+                      );
+                      db.collection("users")
+                        .doc(userId)
+                        .collection("fcmTokens")
+                        .doc(failedToken)
+                        .delete()
+                        .catch((err) =>
+                          console.log("Error removing token:", err),
+                        );
+                    }
+                  });
+                }
+              } catch (error) {
+                console.error(`   ❌ Error in fallback:`, error);
+                await notification.ref.update({
+                  status: "failed",
+                  error: error.message,
+                  failedAt: admin.firestore.FieldValue.serverTimestamp(),
+                });
+              }
+            } else {
+              console.log(`   ⚠️ No tokens available at all for this user`);
+              await notification.ref.update({
+                status: "failed",
+                note: "No tokens available for this user",
+                failedAt: admin.firestore.FieldValue.serverTimestamp(),
+              });
+            }
+          }
         }
       }
     }
@@ -474,6 +637,6 @@ app.listen(PORT, () => {
   console.log(`   - /users-from-tokens (finds users from fcmTokens)`);
   console.log(`   - /debug-full (comprehensive view)`);
   console.log(`   - /test (list collections)`);
-  console.log(`   - /debug-auth (check credentialss)`);
+  console.log(`   - /debug-auth (check credentials)`);
   console.log(`   - / (health check)`);
 });
